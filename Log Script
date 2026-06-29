@@ -1,0 +1,91 @@
+# ============================================================
+# Send-WindowsLogsToSplunk.ps1
+# Reads Windows Security Event Logs and forwards to Splunk HEC
+# Author: Pablo's Home SOC Lab
+# ============================================================
+
+# --- CONFIGURATION ---
+$HEC_URL   = "https://prd-p-lb42n.splunkcloud.com:8088/services/collector"
+$HEC_TOKEN = "e15b4117-8ab9-4dc4-94fa-6f8477287f19"
+$INDEX     = "main"
+$POLL_INTERVAL_SECONDS = 60
+$LOOKBACK_MINUTES      = 5
+
+# Event IDs to monitor
+$EVENT_IDS = @(4624, 4625, 4648, 4672, 4688, 4698, 4720, 4726)
+
+# --- BYPASS SSL VALIDATION ---
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# --- FUNCTIONS ---
+function Send-ToSplunk {
+    param ([System.Diagnostics.EventLogEntry]$Event)
+
+    $eventData = @{
+        EventID       = $Event.EventID
+        Message       = $Event.Message -replace "`r`n", " " -replace "`n", " "
+        EntryType     = $Event.EntryType.ToString()
+        Source        = $Event.Source
+        MachineName   = $Event.MachineName
+        UserName      = $Event.UserName
+        TimeGenerated = $Event.TimeGenerated.ToString("o")
+    }
+
+    $payload = '{"event":' + ($eventData | ConvertTo-Json -Compress) + ',"index":"main","sourcetype":"WinEventLog","source":"WinEventLog:Security","host":"' + $env:COMPUTERNAME + '"}'
+
+    try {
+        $headers = @{ Authorization = "Splunk $HEC_TOKEN" }
+        $response = Invoke-RestMethod -Uri $HEC_URL -Method Post `
+            -Headers $headers -Body $payload -ContentType "application/json"
+        return $true
+    } catch {
+        Write-Warning "Failed to send EventID $($Event.EventID): $_"
+        return $false
+    }
+}
+
+function Get-RecentSecurityEvents {
+    param([int]$MinutesBack = 5)
+    $startTime = (Get-Date).AddMinutes(-$MinutesBack)
+    $log = Get-EventLog -LogName Security -After $startTime -ErrorAction SilentlyContinue
+    if ($log) { return $log | Where-Object { $EVENT_IDS -contains $_.EventID } }
+    return @()
+}
+
+# --- MAIN LOOP ---
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host " Splunk HEC Forwarder - Home SOC Lab" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "Target : $HEC_URL" -ForegroundColor Yellow
+Write-Host "Poll   : Every $POLL_INTERVAL_SECONDS seconds" -ForegroundColor Yellow
+Write-Host "Events : $($EVENT_IDS -join ', ')" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "Starting... Press Ctrl+C to stop." -ForegroundColor Green
+Write-Host ""
+
+$totalSent = 0
+
+while ($true) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "[$timestamp] Polling last $LOOKBACK_MINUTES min..." -ForegroundColor Gray
+
+    $events = Get-RecentSecurityEvents -MinutesBack $LOOKBACK_MINUTES
+    $sent = 0
+
+    foreach ($event in $events) {
+        if (Send-ToSplunk -Event $event) {
+            $sent++
+            $totalSent++
+            Write-Host "  [+] Sent EventID $($event.EventID) at $($event.TimeGenerated)" -ForegroundColor Green
+        }
+    }
+
+    if ($sent -eq 0) {
+        Write-Host "  [ ] No new events." -ForegroundColor DarkGray
+    } else {
+        Write-Host "  Sent $sent event(s). Total: $totalSent" -ForegroundColor Cyan
+    }
+
+    Start-Sleep -Seconds $POLL_INTERVAL_SECONDS
+}
